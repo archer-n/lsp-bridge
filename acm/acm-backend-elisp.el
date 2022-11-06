@@ -84,38 +84,26 @@
 
 ;;; Code:
 
-(defcustom acm-backend-elisp-min-length 2
-  "Minimum length of elisp symbol."
-  :type 'integer)
+(defgroup acm-backend-elisp nil
+  "Elisp backend for acm."
+  :group 'acm)
 
-(defun acm-backend-elisp-sort-predicate (x y)
-  "Sorting predicate which compares X and Y."
-  (or (< (length x) (length y))
-      (and (= (length x) (length y))
-           (string< x y))))
+(defvar-local acm-backend-elisp-items nil)
 
 (defun acm-backend-elisp-candidates (keyword)
   (let* ((candidates (list)))
-    (when (and (or (derived-mode-p 'emacs-lisp-mode)
-                   (derived-mode-p 'inferior-emacs-lisp-mode)
-                   (derived-mode-p 'lisp-interaction-mode))
-               (>= (length keyword) acm-backend-elisp-min-length))
-      (let ((elisp-symbols (sort (all-completions keyword obarray) 
-                                 'acm-backend-elisp-sort-predicate)))
-        (dolist (elisp-symbol (cl-subseq elisp-symbols 0 (min (length elisp-symbols) 10)))
-          (let ((symbol-type (acm-backend-elisp-symbol-type (intern elisp-symbol))))
-            (add-to-list 'candidates (list :key elisp-symbol
-                                           :icon symbol-type
-                                           :label elisp-symbol
-                                           :display-label elisp-symbol
-                                           :annotation (capitalize symbol-type)
-                                           :backend "elisp")
-                         t)))))
+    (when (and (acm-is-elisp-mode-p))
+      (dolist (elisp-symbol acm-backend-elisp-items)
+        (let ((symbol-type (acm-backend-elisp-symbol-type (intern elisp-symbol))))
+          (add-to-list 'candidates (list :key elisp-symbol
+                                         :icon symbol-type
+                                         :label elisp-symbol
+                                         :display-label elisp-symbol
+                                         :annotation (capitalize symbol-type)
+                                         :backend "elisp")
+                       t))))
 
     candidates))
-
-(defun acm-backend-elisp-candidate-fetch-doc (candidate)
-  (acm-doc-show))
 
 (defun acm-backend-elisp-candidate-doc (candidate)
   (let* ((symbol (intern (plist-get candidate :label)))
@@ -128,7 +116,11 @@
            (documentation-property symbol 'variable-documentation)))))  
 
 (defun acm-backend-elisp-symbol-type (symbol)
-  (cond ((functionp symbol)
+  (cond ((featurep symbol)
+         "feature")
+        ((special-form-p symbol)
+         "special form")
+        ((functionp symbol)
          "function")
         ((macrop symbol)
          "macro")
@@ -136,6 +128,8 @@
          "face")
         ((custom-variable-p symbol)
          "custom")
+        ((get symbol 'risky-local-variable)
+         "constant")
         (t
          "variable")))
 

@@ -67,7 +67,6 @@ class SearchFileWords:
                 
             search_candidates = self.search_word(prefix, all_words)
             candidates = []
-            
             if len(search_candidates) > 0:
                 candidates = search_candidates
             elif ("-" in prefix) and (not prefix.endswith("-")):
@@ -81,13 +80,13 @@ class SearchFileWords:
                 
                 candidates = list(map(lambda word: prefix[:-len(search_prefix)] + word, candidates))
                 
-            if len(candidates) > 0:
-                eval_in_emacs("lsp-bridge-record-search-words-items", candidates[:min(3, len(candidates))])
+
+            eval_in_emacs("lsp-bridge-search-file-words--record-items", candidates[:min(3, len(candidates))])
         except:
             logger.error(traceback.format_exc())
             
     def search_word(self, prefix, all_words):
-        match_words = list(filter(lambda word: word.startswith(prefix.lower()), all_words))
+        match_words = list(filter(lambda word: word.lower().startswith(prefix.lower()), all_words))
         candidates = []
         if prefix.isupper():
             candidates = list(map(lambda word: word.upper(), match_words))
@@ -111,7 +110,7 @@ class SearchFileWords:
                     for search_file in self.search_files:
                         try:
                             words = set(re.findall("[\w|-]+", open(search_file).read()))
-                        except UnicodeDecodeError:
+                        except (FileNotFoundError, UnicodeDecodeError):
                             continue
                         filter_words = set(map(lambda word: re.sub('[^A-Za-z0-9-_]+', '', word),
                                                set(filter(self.filter_word, words))))

@@ -29,31 +29,30 @@ from typing import Dict
 
 from epc.server import ThreadingEPCServer
 
-from core.fileaction import FileAction, create_file_action, FILE_ACTION_DICT, LSP_SERVER_DICT
+from core.fileaction import (FileAction, 
+                             create_file_action_with_single_server, 
+                             create_file_action_with_multi_servers,
+                             FILE_ACTION_DICT, LSP_SERVER_DICT)
 from core.lspserver import LspServer
 from core.search_file_words import SearchFileWords
+from core.search_sdcv_words import SearchSdcvWords
+from core.search_elisp_symbols import SearchElispSymbols
+from core.search_tailwindcss_keywords import SearchTailwindKeywords
+from core.tabnine import TabNine
 from core.utils import *
 from core.handler import *
 
 class LspBridge:
     def __init__(self, args):
-
-        # Object cache to exchange information between Emacs and LSP server.
-        self.search_file_words = SearchFileWords()
-
         # Build EPC interfaces.
-        for name in ["change_file", "change_cursor", "save_file", "ignore_diagnostic", "list_diagnostics"]:
+        handler_subclasses = list(map(lambda cls: cls.name, Handler.__subclasses__()))
+        for name in ["change_file", "update_file", "change_cursor", "save_file", 
+                     "ignore_diagnostic", "list_diagnostics", "workspace_symbol"] + handler_subclasses:
             self.build_file_action_function(name)
-            
-        for name in ["change_file", "close_file", "rebuild_cache", "search"]:
-            self.build_search_words_function(name)
             
         for name in ["open_file", "close_file"]:
             self.build_message_function(name)
             
-        for cls in Handler.__subclasses__():
-            self.build_file_action_function(cls.name)
-
         # Init EPC client port.
         init_epc_client(int(args[0]))
 
@@ -74,7 +73,30 @@ class LspBridge:
         # Start EPC server with sub-thread, avoid block Qt main loop.
         self.server_thread = threading.Thread(target=self.server.serve_forever)
         self.server_thread.start()
+        
+        # Init tabnine.
+        self.tabnine = TabNine()        
 
+        # Init search file words.
+        self.search_file_words = SearchFileWords()
+        for name in ["change_file", "close_file", "rebuild_cache", "search"]:
+            self.build_prefix_function("search_file_words", "search_file_words", name)
+            
+        # Init search sdcv words.
+        self.search_sdcv_words = SearchSdcvWords()
+        for name in ["search"]:
+            self.build_prefix_function("search_sdcv_words", "search_sdcv_words", name)
+            
+        # Init search elisp symbols.
+        self.search_elisp_symbols = SearchElispSymbols()
+        for name in ["search", "update"]:
+            self.build_prefix_function("search_elisp_symbols", "search_elisp_symbols", name)
+
+        # Init search tailwind keywords
+        self.search_tailwind_keywords = SearchTailwindKeywords()
+        for name in ["search"]:
+            self.build_prefix_function("search_tailwind_keywords", "search_tailwind_keywords", name)
+            
         # Init emacs option.
         enable_lsp_server_log = get_emacs_var("lsp-bridge-enable-log")
         if enable_lsp_server_log:
@@ -130,14 +152,6 @@ class LspBridge:
         if is_in_path_dict(FILE_ACTION_DICT, old_filepath):
             get_from_path_dict(FILE_ACTION_DICT, old_filepath).rename_file(old_filepath, new_filepath)
         
-    def completion_hide(self, filepath):
-        if is_in_path_dict(FILE_ACTION_DICT, filepath):
-            get_from_path_dict(FILE_ACTION_DICT, filepath).last_completion_candidates = {}
-            
-    def pull_diagnostics(self, filepath):
-        if is_in_path_dict(FILE_ACTION_DICT, filepath):
-            eval_in_emacs("lsp-bridge-diagnostics-render", filepath, get_from_path_dict(FILE_ACTION_DICT, filepath).diagnostics)
-            
     def fetch_completion_item_info(self, filepath, item_key, server_name):
         if is_in_path_dict(FILE_ACTION_DICT, filepath):
             get_from_path_dict(FILE_ACTION_DICT, filepath).completion_item_resolve(item_key, server_name)
@@ -150,24 +164,16 @@ class LspBridge:
             multi_lang_server_dir = Path(__file__).resolve().parent / "multiserver"
             multi_lang_server_path = multi_lang_server_dir / "{}.json".format(multi_lang_server)
             
-            with open(multi_lang_server_path, encoding="utf-8") as f:
+            with open(multi_lang_server_path, encoding="utf-8", errors="ignore") as f:
                 multi_lang_server_info = json.load(f)
+                servers = self.pick_multi_server_names(multi_lang_server_info)
                 
-                servers = []
-                for info in multi_lang_server_info:
-                    info_value = multi_lang_server_info[info]
-                    if type(info_value) == str:
-                        servers.append(info_value)
-                    else:
-                        servers += info_value
-                
-                servers = list(dict.fromkeys(servers))
                 multi_servers = {}
                 
                 for server_name in servers:
                     server_path = get_lang_server_path(server_name)
                     
-                    with open(server_path, encoding="utf-8") as server_path_file:
+                    with open(server_path, encoding="utf-8", errors="ignore") as server_path_file:
                         lang_server_info = json.load(server_path_file)
                         lsp_server = self.create_lsp_server(filepath, project_path, lang_server_info)
                         if lsp_server:
@@ -175,32 +181,37 @@ class LspBridge:
                         else:
                             return False
                         
-                action = FileAction(filepath, None, None, multi_lang_server_info, multi_servers)
-                add_to_path_dict(FILE_ACTION_DICT, filepath, action)
+                create_file_action_with_multi_servers(filepath, multi_lang_server_info, multi_servers)
         else:
             single_lang_server = get_emacs_func_result("get-single-lang-server", project_path, filepath)
             
-            if (single_lang_server == "clojure-lsp") and (not os.path.isdir(project_path)):
-                message_emacs("ERROR: can't determine the project root for {}, initialize a Git repository for the project before you open this file.".format(filepath))
-                eval_in_emacs("lsp-bridge-turn-off", filepath)
-            
-                return False
-            
             if not single_lang_server:
-                message_emacs("ERROR: can't find the corresponding server for {}, disable lsp-bridge-mode.".format(filepath))
-                eval_in_emacs("lsp-bridge-turn-off", filepath)
+                self.turn_off(filepath, "ERROR: can't find the corresponding server for {}, disable lsp-bridge-mode.".format(filepath))
             
                 return False
             
-            lang_server_info = load_single_lang_server_info(single_lang_server)
+            lang_server_info = load_single_server_info(single_lang_server)
+            if ((not os.path.isdir(project_path)) and
+                "support-single-file" in lang_server_info and
+                lang_server_info["support-single-file"] == False):
+                self.turn_off(
+                    filepath,
+                    "ERROR: {} not support single-file, put this file in a git repository to enable lsp-bridge-mode.".format(single_lang_server))
+            
+                return False
+            
             lsp_server = self.create_lsp_server(filepath, project_path, lang_server_info)
             
             if lsp_server:
-                create_file_action(filepath, lang_server_info, lsp_server)
+                create_file_action_with_single_server(filepath, lang_server_info, lsp_server)
             else:
                 return False
         
         return True
+    
+    def turn_off(self, filepath, message):
+        message_emacs(message)
+        eval_in_emacs("lsp-bridge--turn-off", filepath)
     
     def create_lsp_server(self, filepath, project_path, lang_server_info):
         if len(lang_server_info["command"]) > 0:
@@ -210,13 +221,12 @@ class LspBridge:
                 # We always replace LSP server command with absolute path of 'which' command.
                 lang_server_info["command"][0] = server_command_path
             else:
-                message_emacs("Error: can't find LSP server '{}' for {}, disable lsp-bridge-mode.".format(server_command, filepath))
-                eval_in_emacs("lsp-bridge-turn-off", filepath)
+                self.turn_off(filepath, "Error: can't find command '{}' to start LSP server {} ({}), disable lsp-bridge-mode.".format(
+                    server_command, lang_server_info["name"], filepath))
         
                 return False
         else:
-            message_emacs("Error: {}'s command argument is empty, disable lsp-bridge-mode.".format(filepath))
-            eval_in_emacs("lsp-bridge-turn-off", filepath)
+            self.turn_off(filepath, "Error: {}'s command argument is empty, disable lsp-bridge-mode.".format(filepath))
         
             return False
         
@@ -230,6 +240,17 @@ class LspBridge:
                 server_name=lsp_server_name)
             
         return LSP_SERVER_DICT[lsp_server_name]
+    
+    def pick_multi_server_names(self, multi_lang_server_info):
+        servers = []
+        for info in multi_lang_server_info:
+            info_value = multi_lang_server_info[info]
+            if type(info_value) == str:
+                servers.append(info_value)
+            else:
+                servers += info_value
+        
+        return list(dict.fromkeys(servers))
 
     def _close_file(self, filepath):
         if is_in_path_dict(FILE_ACTION_DICT, filepath):
@@ -257,12 +278,12 @@ class LspBridge:
 
         setattr(self, name, _do_wrap)
         
-    def build_search_words_function(self, name):
+    def build_prefix_function(self, obj_name, prefix, name):
         def _do(*args, **kwargs):
-            getattr(self.search_file_words, name)(*args, **kwargs)
+            getattr(getattr(self, obj_name), name)(*args, **kwargs)
 
-        setattr(self, "search_words_{}".format(name), _do)
-
+        setattr(self, "{}_{}".format(prefix, name), _do)
+        
     def build_message_function(self, name):
         def _do(filepath):
             self.event_queue.put({
@@ -271,13 +292,16 @@ class LspBridge:
             })
             
         setattr(self, name, _do)
+        
+    def tabnine_complete(self, before, after, filename, region_includes_beginning, region_includes_end, max_num_results):
+        self.tabnine.complete(before, after, filename, region_includes_beginning, region_includes_end, max_num_results)
             
     def handle_server_process_exit(self, server_name):
         if server_name in LSP_SERVER_DICT:
             logger.info("Exit server: {}".format(server_name))
             del LSP_SERVER_DICT[server_name]
             
-    def search_words_index_files(self, filepaths):
+    def search_file_words_index_files(self, filepaths):
         for filepath in filepaths:
             self.search_file_words.change_file(filepath)
         
@@ -291,7 +315,7 @@ class LspBridge:
         start_test(self)
 
 
-def load_single_lang_server_info(lang_server):
+def load_single_server_info(lang_server):
     lang_server_info_path = ""
     if os.path.exists(lang_server) and os.path.dirname(lang_server) != "":
         # If lang_server is real file path, we load the LSP server configuration from the user specified file.
@@ -300,7 +324,7 @@ def load_single_lang_server_info(lang_server):
         # Otherwise, we load LSP server configuration from file lsp-bridge/langserver/lang_server.json.
         lang_server_info_path = get_lang_server_path(lang_server)
 
-    with open(lang_server_info_path, encoding="utf-8") as f:
+    with open(lang_server_info_path, encoding="utf-8", errors="ignore") as f:
         return json.load(f)
     
 def get_lang_server_path(server_name):

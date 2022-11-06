@@ -27,7 +27,18 @@ import logging
 import pathlib
 import platform
 import sys
+import subprocess
+import queue
+import traceback
+import os
+
 from epc.client import EPCClient
+from threading import Thread
+
+try:
+    import orjson as json_parser
+except:
+    import json as json_parser
 
 KIND_MAP = ["", "Text", "Method", "Function", "Constructor", "Field",
             "Variable", "Class", "Interface", "Module", "Property",
@@ -225,3 +236,38 @@ def get_emacs_version():
 
 def get_os_name():
     return platform.system().lower()
+
+def parse_json_content(content):
+    return json_parser.loads(content)
+
+def windows_get_env_value(var_name: str) -> str:
+    """
+    Read a Windows environment variable by os.environ and return its value.
+    """
+    if var_name in os.environ.keys():
+        return os.environ[var_name]
+
+def windows_parse_path(path: str) -> str:
+    return path.replace("%USERPROFILE%", windows_get_env_value("USERPROFILE"))
+
+class MessageSender(Thread):
+    
+    def __init__(self, process: subprocess.Popen):
+        super().__init__()
+        
+        self.process = process
+        self.queue = queue.Queue()
+        
+    def send_request(self, message):
+        self.queue.put(message)
+        
+class MessageReceiver(Thread):
+    
+    def __init__(self, process: subprocess.Popen):
+        super().__init__()
+        
+        self.process = process
+        self.queue = queue.Queue()
+        
+    def get_message(self):
+        return self.queue.get(block=True)
